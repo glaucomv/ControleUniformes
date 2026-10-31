@@ -101,3 +101,4 @@ Para não começar do zero digitando colaborador por colaborador:
 3. No aplicativo web, acesse **Cadastros > Importação**.
 4. Clique no botão de importação na ordem indicada (Colaboradores -> Estoque -> Entregas).
 5. O sistema valida 100% dos dados. Se alguma linha tiver tamanho inválido ou cargo incorreto, ele aponta exatamente a linha para você corrigir na planilha antes de gravar.
+

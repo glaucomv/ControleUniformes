@@ -59,3 +59,4 @@ As regras de negócio (cálculo de datas, ciclos periódicos, pendências, estoq
 ```bash
 npm test
 ```
+

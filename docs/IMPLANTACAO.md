@@ -93,3 +93,4 @@ Se você tem familiaridade com o terminal:
    - **ALMOXARIFE:** Acesso ao Painel, Estoque, Recebimento de Mercadorias, Cadastro de Colaboradores e Registro de Entregas.
 3. Como usamos contas Gmail comuns, cada operador precisa ter permissão de **Editor** na planilha Google (o próprio sistema tenta compartilhar automaticamente ao salvar o usuário, ou você pode clicar em **Compartilhar** na planilha e adicionar os e-mails).
 4. Envie a **URL do Web App** para a equipe.
+

@@ -239,3 +239,4 @@ describe('Logic - Validacoes', () => {
     assert.match(err[0], /disponivel 4, solicitado 5/);
   });
 });
+

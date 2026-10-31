@@ -153,26 +153,51 @@ const ROTAS = [
   [/^#\/recebimentos$/, viewRecebimentos, 'recebimentos'],
   [/^#\/recebimento-novo(?:\/([^/]+))?$/, viewRecebimentoNovo, 'recebimentos'],
   [/^#\/estoque$/, viewEstoque, 'estoque'],
+  [/^#\/usuarios$/, () => viewCadastros('usuarios'), 'usuarios'],
   [/^#\/cadastros(?:\/(\w+))?$/, viewCadastros, 'cadastros']
 ];
 
+let renderingHash = null;
+
 async function render() {
   const hash = location.hash || '#/painel';
+  if (renderingHash === hash) return;
+  renderingHash = hash;
   S.token++;
   $('#nav').classList.remove('aberto');
-  for (const [re, fn, menu] of ROTAS) {
-    const m = hash.match(re);
-    if (!m) continue;
-    $$('#nav a').forEach(a => a.classList.toggle('ativo', a.dataset.route === menu));
-    app.innerHTML = '<div class="loading">Carregando...</div>';
-    window.scrollTo(0, 0);
-    try { await fn.apply(null, m.slice(1)); }
-    catch (e) { if (!(e instanceof Stale)) app.innerHTML = `<div class="alerta-box erro">${esc(e.message)}</div>`; }
-    return;
+  try {
+    for (const [re, fn, menu] of ROTAS) {
+      const m = hash.match(re);
+      if (!m) continue;
+      $$('#nav a').forEach(a => a.classList.toggle('ativo', a.dataset.route === menu));
+      app.innerHTML = '<div class="loading">Carregando...</div>';
+      window.scrollTo(0, 0);
+      try { await fn.apply(null, m.slice(1)); }
+      catch (e) { if (!(e instanceof Stale)) app.innerHTML = `<div class="alerta-box erro">${esc(e.message)}</div>`; }
+      return;
+    }
+    location.hash = '#/painel';
+  } finally {
+    renderingHash = null;
   }
-  location.hash = '#/painel';
 }
-function ir(hash) { if (location.hash === hash) render(); else location.hash = hash; }
+function ir(hash) {
+  if (location.hash !== hash) {
+    location.hash = hash;
+  }
+  render();
+}
+
+// Intercepta cliques em links internos (#/...) para evitar que o navegador tente abrir nova aba ou navegar janela pai
+document.addEventListener('click', e => {
+  const a = e.target.closest('a');
+  if (!a) return;
+  const href = a.getAttribute('href');
+  if (href && href.startsWith('#/')) {
+    e.preventDefault();
+    ir(href);
+  }
+});
 
 // ------------------------------------------------------------------ painel
 async function viewPainel() {
@@ -646,8 +671,8 @@ async function viewEstoque() {
 
 // ------------------------------------------------------------------ cadastros
 const ABAS_CAD = [
-  ['itens', 'Itens', 'admin'], ['grades', 'Grades de tamanho', 'admin'], ['cargos', 'Cargos e kits', 'admin'],
-  ['fornecedores', 'Fornecedores', 'fornecedores'], ['usuarios', 'Usuarios', 'admin'], ['config', 'Configuracoes', 'admin'], ['importacao', 'Importacao', 'admin']
+  ['usuarios', 'Usuarios', 'admin'], ['itens', 'Itens', 'admin'], ['grades', 'Grades de tamanho', 'admin'], ['cargos', 'Cargos e kits', 'admin'],
+  ['fornecedores', 'Fornecedores', 'fornecedores'], ['config', 'Configuracoes', 'admin'], ['importacao', 'Importacao', 'admin']
 ];
 
 async function viewCadastros(aba) {
