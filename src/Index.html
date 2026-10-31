@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <?!= include('Styles'); ?>
+</head>
+<body>
+  <header class="topbar no-print">
+    <button id="btnMenu" class="icon-btn" aria-label="Menu">&#9776;</button>
+    <div class="brand">Controle de Uniformes</div>
+    <div id="userInfo" class="user-info"></div>
+  </header>
+  <div class="layout">
+    <nav id="nav" class="nav no-print">
+      <a href="#/painel" data-route="painel">Painel</a>
+      <a href="#/colaboradores" data-route="colaboradores">Colaboradores</a>
+      <a href="#/entregas" data-route="entregas">Entregas</a>
+      <a href="#/sugestao" data-route="sugestao">Sugestao de compra</a>
+      <a href="#/pedidos" data-route="pedidos">Pedidos</a>
+      <a href="#/recebimentos" data-route="recebimentos">Recebimentos</a>
+      <a href="#/estoque" data-route="estoque">Estoque</a>
+      <a href="#/cadastros" data-route="cadastros" data-perm="admin">Cadastros</a>
+    </nav>
+    <main id="app" class="content">
+      <div class="loading">Carregando...</div>
+    </main>
+  </div>
+  <div id="toast" class="toast no-print"></div>
+  <div id="busy" class="busy no-print"><div class="spinner"></div></div>
+  <?!= include('App'); ?>
+</body>
+</html>
+

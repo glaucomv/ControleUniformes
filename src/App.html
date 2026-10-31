@@ -1,0 +1,828 @@
+<script>
+'use strict';
+/* =====================================================================
+ * App.html - Interface (SPA em JS puro). Toda regra de negocio fica no
+ * servidor (Api.js / Logic.js); aqui apenas exibicao e coleta de dados.
+ * ===================================================================== */
+const S = { ref: null, token: 0, rascunhoPedido: null, filtros: {} };
+const app = document.getElementById('app');
+const $ = (sel, el) => (el || document).querySelector(sel);
+const $$ = (sel, el) => Array.from((el || document).querySelectorAll(sel));
+
+// ------------------------------------------------------------------ utilitarios
+function esc(v) {
+  return String(v === null || v === undefined ? '' : v).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function fmtData(iso) { if (!iso) return ''; const p = String(iso).slice(0, 10).split('-'); return p.length === 3 ? `${p[2]}/${p[1]}/${p[0]}` : iso; }
+function toast(msg, erro) {
+  const t = $('#toast'); t.textContent = msg; t.className = 'toast show' + (erro ? ' erro' : '');
+  clearTimeout(toast._t); toast._t = setTimeout(() => { t.className = 'toast'; }, erro ? 7000 : 3500);
+}
+let busyCount = 0;
+function busy(on) { busyCount += on ? 1 : -1; $('#busy').classList.toggle('show', busyCount > 0); }
+
+class Stale extends Error {}
+
+function call(action, payload) {
+  busy(true);
+  return new Promise((resolve, reject) => {
+    google.script.run
+      .withSuccessHandler(r => (r && r.ok) ? resolve(r.data) : reject(new Error(r ? r.error : 'Sem resposta do servidor.')))
+      .withFailureHandler(err => reject(new Error((err && err.message) || String(err))))
+      .api(action, payload || {});
+  }).finally(() => busy(false));
+}
+/** Carrega dados para a tela atual; descarta se o usuario ja navegou para outra. */
+async function load(action, payload) {
+  const t = S.token;
+  const d = await call(action, payload);
+  if (t !== S.token) throw new Stale();
+  return d;
+}
+/** Executa uma gravacao mostrando erro em toast. Retorna null em caso de erro. */
+async function salvar(action, payload, msgOk) {
+  try { const r = await call(action, payload); if (msgOk) toast(msgOk); return r || {}; }
+  catch (e) { toast(e.message, true); return null; }
+}
+async function recarregarRef() { S.ref = await call('bootstrap'); }
+
+function pode(perm) { return S.ref.user.permissoes.indexOf(perm) >= 0; }
+function porId(lista, id) { return lista.find(x => x.id === id) || null; }
+function itemNome(id) { const i = porId(S.ref.itens, id); return i ? i.nome : id; }
+function cargoNome(id) { const c = porId(S.ref.cargos, id); return c ? c.nome : ''; }
+function fornNome(id) { const f = porId(S.ref.fornecedores, id); return f ? f.nome : ''; }
+function tamanhosGrade(g) { return !g || g.id === 'UNICO' ? ['U'] : String(g.tamanhos || '').split(',').map(s => s.trim()).filter(Boolean); }
+function tamanhosItem(itemId) { const i = porId(S.ref.itens, itemId); return i ? tamanhosGrade(porId(S.ref.grades, i.grade_id)) : []; }
+function gradesComTamanho() { return S.ref.grades.filter(g => g.ativo && g.id !== 'UNICO').sort((a, b) => a.ordem - b.ordem); }
+function itensResumo(itens) { return itens.map(i => `${i.quantidade}x ${esc(itemNome(i.item_id))} (${esc(i.tamanho)})`).join(', '); }
+function chave(i, t) { return i + '|' + t; }
+
+function opts(lista, sel, val, lab, placeholder) {
+  return (placeholder !== undefined ? `<option value="">${esc(placeholder)}</option>` : '') +
+    lista.map(x => { const v = typeof val === 'function' ? val(x) : x[val]; return `<option value="${esc(v)}"${String(v) === String(sel === undefined || sel === null ? '' : sel) ? ' selected' : ''}>${esc(lab(x))}</option>`; }).join('');
+}
+function opcoesTam(itemId, sel) {
+  if (!itemId) return '<option value="">-</option>';
+  const ts = tamanhosItem(itemId);
+  return (ts.length > 1 ? '<option value="">Tam...</option>' : '') + ts.map(t => `<option${t === sel ? ' selected' : ''}>${esc(t)}</option>`).join('');
+}
+function linha(cells, cls) { cells.cls = cls; return cells; }
+function tabela(cols, linhas, vazio) {
+  const th = cols.map(c => `<th class="${c[1] || ''}">${esc(c[0])}</th>`).join('');
+  const body = linhas.length
+    ? linhas.map(l => `<tr${l.cls ? ` class="${l.cls}"` : ''}>${l.map((v, i) => `<td class="${(cols[i] && cols[i][1]) || ''}">${v === undefined || v === null ? '' : v}</td>`).join('')}</tr>`).join('')
+    : `<tr><td colspan="${cols.length}" class="vazio">${esc(vazio || 'Nenhum registro.')}</td></tr>`;
+  return `<div class="table-wrap"><table><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+function badge(txt, cor) { return `<span class="badge ${cor || ''}">${esc(txt)}</span>`; }
+const STATUS_COR = { ABERTO: 'azul', PARCIAL: 'amarelo', CONCLUIDO: 'verde', ENCERRADO: '', CANCELADO: 'vermelho' };
+const STATUS_TXT = { ABERTO: 'Aberto', PARCIAL: 'Parcial', CONCLUIDO: 'Concluido', ENCERRADO: 'Encerrado c/ pendencia', CANCELADO: 'Cancelado' };
+const MOTIVO_TXT = { KIT: 'Kit (direito)', SUBSTITUICAO: 'Substituicao' };
+const DIVERG_TXT = { FALTANTE: 'Faltou', EXCEDENTE: 'Veio a mais', REJEITADO: 'Rejeitado (defeito/avaria)', NAO_PEDIDO: 'Nao pedido (tamanho/item errado)' };
+function badgeStatus(s, atrasado) { return badge(STATUS_TXT[s] || s, STATUS_COR[s]) + (atrasado ? ' ' + badge('Atrasado', 'vermelho') : ''); }
+function lerForm(form) {
+  const o = {};
+  $$('[name]', form).forEach(el => { o[el.name] = el.type === 'checkbox' ? el.checked : el.value; });
+  return o;
+}
+function kpi(valor, rotulo, cls, href) {
+  const inner = `<div class="v">${esc(valor)}</div><div class="l">${esc(rotulo)}</div>`;
+  return href ? `<a class="kpi ${cls || ''}" href="${href}">${inner}</a>` : `<div class="kpi ${cls || ''}">${inner}</div>`;
+}
+
+/**
+ * Editor de linhas de itens (pedido, entrega, recebimento, kit).
+ * colunas: [{titulo, cls, render(linha) => html com campos data-f}]
+ */
+function editorLinhas(el, cfg) {
+  el.innerHTML = `<div class="table-wrap"><table><thead><tr>${cfg.colunas.map(c => `<th class="${c.cls || ''}">${esc(c.titulo)}</th>`).join('')}<th></th></tr></thead><tbody></tbody></table></div>` +
+    (cfg.semAdicionar ? '' : `<button type="button" class="btn sec peq" data-add style="margin-top:8px">+ ${esc(cfg.rotuloAdicionar || 'Adicionar item')}</button>`);
+  const tbody = $('tbody', el);
+  const atualizar = tr => { if (cfg.onRow) cfg.onRow(tr); };
+  const add = l => {
+    l = l || {};
+    const tr = document.createElement('tr');
+    tr.innerHTML = cfg.colunas.map(c => `<td class="${c.cls || ''}">${c.render(l)}</td>`).join('') +
+      `<td>${l._fixo ? '' : '<button type="button" class="btn perigo peq" data-del title="Remover">&times;</button>'}</td>`;
+    tbody.appendChild(tr); atualizar(tr);
+  };
+  (cfg.linhas || []).forEach(add);
+  if (!(cfg.linhas || []).length && !cfg.semAdicionar && !cfg.iniciarVazio) add();
+  el.addEventListener('click', e => {
+    if (e.target.matches('[data-del]')) { e.target.closest('tr').remove(); atualizar(null); }
+    if (e.target.matches('[data-add]')) add(cfg.novaLinha ? cfg.novaLinha() : {});
+  });
+  el.addEventListener('change', e => {
+    const tr = e.target.closest('tr');
+    if (e.target.matches('[data-f=item_id]') && tr) {
+      const ts = $('[data-f=tamanho]', tr);
+      if (ts && ts.tagName === 'SELECT') ts.innerHTML = opcoesTam(e.target.value, '');
+    }
+    atualizar(tr);
+  });
+  el.addEventListener('input', e => atualizar(e.target.closest('tr')));
+  return {
+    tbody,
+    adicionar: add,
+    ler: () => $$('tr', tbody).map(tr => { const o = {}; $$('[data-f]', tr).forEach(i => { o[i.dataset.f] = i.value; }); return o; })
+  };
+}
+const R = {
+  item: l => `<select data-f="item_id">${opts(S.ref.itens.filter(i => i.ativo || i.id === l.item_id), l.item_id, 'id', i => i.nome, 'Selecione...')}</select>`,
+  itemFixo: l => `${esc(itemNome(l.item_id))}<input type="hidden" data-f="item_id" value="${esc(l.item_id)}">`,
+  tam: l => `<select data-f="tamanho">${opcoesTam(l.item_id, l.tamanho)}</select>`,
+  tamFixo: l => `${esc(l.tamanho)}<input type="hidden" data-f="tamanho" value="${esc(l.tamanho)}">`,
+  num: (f, min) => l => `<input type="number" min="${min === undefined ? 0 : min}" step="1" data-f="${f}" value="${esc(l[f] === undefined ? '' : l[f])}" style="width:90px">`,
+  texto: (f, ph) => l => `<input data-f="${f}" value="${esc(l[f] || '')}" placeholder="${esc(ph || '')}">`,
+  motivo: l => `<select data-f="motivo">${opts(Object.keys(MOTIVO_TXT), l.motivo || 'KIT', x => x, x => MOTIVO_TXT[x])}</select>`
+};
+
+// ------------------------------------------------------------------ roteamento
+const ROTAS = [
+  [/^#\/painel$/, viewPainel, 'painel'],
+  [/^#\/colaboradores$/, viewColaboradores, 'colaboradores'],
+  [/^#\/colaborador\/([^/]+)$/, viewFicha, 'colaboradores'],
+  [/^#\/colaborador-form\/([^/]+)$/, viewColabForm, 'colaboradores'],
+  [/^#\/entregas$/, viewEntregas, 'entregas'],
+  [/^#\/entrega-nova(?:\/([^/]+))?$/, viewEntregaNova, 'entregas'],
+  [/^#\/termo\/([^/]+)$/, viewTermo, 'entregas'],
+  [/^#\/sugestao$/, viewSugestao, 'sugestao'],
+  [/^#\/pedidos$/, viewPedidos, 'pedidos'],
+  [/^#\/pedido-novo$/, viewPedidoNovo, 'pedidos'],
+  [/^#\/pedido\/([^/]+)$/, viewPedido, 'pedidos'],
+  [/^#\/recebimentos$/, viewRecebimentos, 'recebimentos'],
+  [/^#\/recebimento-novo(?:\/([^/]+))?$/, viewRecebimentoNovo, 'recebimentos'],
+  [/^#\/estoque$/, viewEstoque, 'estoque'],
+  [/^#\/cadastros(?:\/(\w+))?$/, viewCadastros, 'cadastros']
+];
+
+async function render() {
+  const hash = location.hash || '#/painel';
+  S.token++;
+  $('#nav').classList.remove('aberto');
+  for (const [re, fn, menu] of ROTAS) {
+    const m = hash.match(re);
+    if (!m) continue;
+    $$('#nav a').forEach(a => a.classList.toggle('ativo', a.dataset.route === menu));
+    app.innerHTML = '<div class="loading">Carregando...</div>';
+    window.scrollTo(0, 0);
+    try { await fn.apply(null, m.slice(1)); }
+    catch (e) { if (!(e instanceof Stale)) app.innerHTML = `<div class="alerta-box erro">${esc(e.message)}</div>`; }
+    return;
+  }
+  location.hash = '#/painel';
+}
+function ir(hash) { if (location.hash === hash) render(); else location.hash = hash; }
+
+// ------------------------------------------------------------------ painel
+async function viewPainel() {
+  const d = await load('painel');
+  const k = d.kpis;
+  app.innerHTML = `
+    <h1>Painel</h1>
+    <div class="kpis">
+      ${kpi(k.itens_pendentes, 'Itens pendentes de entrega', k.itens_pendentes ? 'alerta' : 'ok', '#/colaboradores')}
+      ${kpi(k.colaboradores_com_pendencia + ' / ' + k.colaboradores_ativos, 'Colaboradores com pendencia', '', '#/colaboradores')}
+      ${kpi(k.pendencias_atrasadas, 'Pendencias atrasadas (> ' + d.tolerancia + ' dias)', k.pendencias_atrasadas ? 'alerta' : 'ok')}
+      ${kpi(k.prontas_para_entrega, 'Pendentes que ja tem estoque (entregar!)', k.prontas_para_entrega ? 'alerta' : 'ok', '#/estoque')}
+      ${kpi(k.sem_tamanho, 'Pendencias sem tamanho cadastrado', k.sem_tamanho ? 'alerta' : 'ok', '#/sugestao')}
+      ${kpi(k.pedidos_abertos, 'Pedidos em aberto', '', '#/pedidos')}
+      ${kpi(k.saldo_fornecedor, 'Itens que o fornecedor ainda deve', k.saldo_fornecedor ? 'alerta' : 'ok', '#/pedidos')}
+      ${kpi(k.pedidos_atrasados, 'Pedidos com entrega atrasada', k.pedidos_atrasados ? 'alerta' : 'ok', '#/pedidos')}
+      ${kpi(k.trocas_30 + ' / ' + k.trocas_60 + ' / ' + k.trocas_90, 'Trocas previstas em 30 / 60 / 90 dias', '', '#/sugestao')}
+    </div>
+    <h2>Pendencias por item e tamanho</h2>
+    ${tabela([['Item'], ['Tam.'], ['Pendente', 'num'], ['Colab.', 'num'], ['Estoque', 'num'], ['Em pedido', 'num'], ['Pode entregar ja', 'num']],
+      d.porItem.map(l => linha([esc(itemNome(l.item_id)), l.tamanho === '?' ? badge('sem tamanho', 'vermelho') : esc(l.tamanho), l.pendente, l.colaboradores, l.estoque, l.em_pedido,
+        l.pronto_entrega ? badge(l.pronto_entrega, 'verde') : '0'])), 'Nenhuma pendencia. Todos os colaboradores estao em dia.')}
+    <h2>Pendencias atrasadas</h2>
+    ${tabela([['Colaborador'], ['Matr.'], ['Item'], ['Tam.'], ['Qtd', 'num'], ['Dias em aberto', 'num']],
+      d.atrasadas.map(a => [`<a href="#/colaborador/${esc(a.colaborador_id)}">${esc(a.colaborador)}</a>`, esc(a.matricula), esc(itemNome(a.item_id)), esc(a.tamanho || '-'), a.pendente, badge(a.dias, 'vermelho')]),
+      'Nenhuma pendencia atrasada.')}
+    <h2>Pedidos atrasados</h2>
+    ${tabela([['Pedido'], ['Fornecedor'], ['Previsao'], ['Saldo devido', 'num']],
+      d.pedidosAtrasados.map(p => [`<a href="#/pedido/${esc(p.id)}">${esc(p.id)}</a>`, esc(p.fornecedor), fmtData(p.previsao_entrega), p.total_saldo]),
+      'Nenhum pedido atrasado.')}`;
+}
+
+// ------------------------------------------------------------------ colaboradores
+async function viewColaboradores() {
+  const lista = await load('colaboradores.list');
+  const f = S.filtros.colab || { busca: '', filtro: 'ativos' };
+  app.innerHTML = `
+    <h1>Colaboradores</h1>
+    <div class="toolbar">
+      <input id="busca" class="grow" placeholder="Buscar por nome, matricula, posto, cargo..." value="${esc(f.busca)}">
+      <select id="filtro" style="width:auto">
+        ${opts([['ativos', 'Ativos'], ['pend', 'Com pendencia'], ['atraso', 'Com atraso'], ['semtam', 'Sem tamanho'], ['inativos', 'Inativos'], ['todos', 'Todos']], f.filtro, x => x[0], x => x[1])}
+      </select>
+      ${pode('colaboradores') ? '<a class="btn" href="#/colaborador-form/novo">+ Novo colaborador</a>' : ''}
+    </div>
+    <div id="tab"></div>`;
+  const desenhar = () => {
+    f.busca = $('#busca').value; f.filtro = $('#filtro').value; S.filtros.colab = f;
+    const q = f.busca.trim().toLowerCase();
+    const filtrados = lista.filter(c => {
+      if (q && ![c.nome, c.matricula, c.posto, c.cargo].join(' ').toLowerCase().includes(q)) return false;
+      switch (f.filtro) {
+        case 'ativos': return c.ativo;
+        case 'pend': return c.ativo && c.pendentes > 0;
+        case 'atraso': return c.ativo && c.atrasada;
+        case 'semtam': return c.ativo && c.sem_tamanho;
+        case 'inativos': return !c.ativo;
+        default: return true;
+      }
+    });
+    $('#tab').innerHTML = `<p class="hint">${filtrados.length} colaborador(es)</p>` + tabela(
+      [['Matr.'], ['Nome'], ['Cargo'], ['Posto'], ['Situacao'], ['']],
+      filtrados.map(c => [esc(c.matricula), `<a href="#/colaborador/${esc(c.id)}">${esc(c.nome)}</a>`, esc(c.cargo), esc(c.posto),
+        !c.ativo ? badge('Inativo') : (c.pendentes === 0 ? badge('Em dia', 'verde') : badge(c.pendentes + ' pendente(s)', c.atrasada ? 'vermelho' : 'amarelo')) +
+          (c.sem_tamanho ? ' ' + badge('sem tamanho', 'vermelho') : ''),
+        c.ativo && c.pendentes > 0 && pode('entregas') ? `<a class="btn peq" href="#/entrega-nova/${esc(c.id)}">Entregar</a>` : '']),
+      'Nenhum colaborador encontrado.');
+  };
+  $('#busca').oninput = desenhar; $('#filtro').onchange = desenhar; desenhar();
+}
+
+async function viewFicha(id) {
+  const d = await load('colaboradores.ficha', { id });
+  const c = d.colaborador;
+  const pend = d.pendencias;
+  const totalPend = pend.reduce((s, p) => s + p.pendente, 0);
+  app.innerHTML = `
+    <div class="toolbar"><h1 class="grow" style="margin:0">${esc(c.nome)}</h1>
+      ${pode('colaboradores') ? `<a class="btn sec" href="#/colaborador-form/${esc(c.id)}">Editar</a>` : ''}
+      ${pode('entregas') && c.ativo ? `<a class="btn" href="#/entrega-nova/${esc(c.id)}">Registrar entrega</a>` : ''}
+    </div>
+    <div class="card">
+      <div class="info-grid">
+        <div><span>Matricula</span>${esc(c.matricula || '-')}</div>
+        <div><span>Cargo</span>${esc(d.cargo)}</div>
+        <div><span>Posto / contrato</span>${esc(c.posto || '-')}</div>
+        <div><span>Admissao</span>${fmtData(c.admissao)}</div>
+        <div><span>Situacao</span>${c.ativo ? badge('Ativo', 'verde') : badge('Inativo') + ' ' + fmtData(c.desligamento)}</div>
+        <div><span>Telefone</span>${esc(c.telefone || '-')}</div>
+        ${gradesComTamanho().map(g => `<div><span>Tam. ${esc(g.nome)}</span>${c.tamanhos && c.tamanhos[g.id] ? esc(c.tamanhos[g.id]) : badge('nao informado', 'amarelo')}</div>`).join('')}
+      </div>
+      ${c.obs ? `<p class="hint">${esc(c.obs)}</p>` : ''}
+    </div>
+    <h2>Direito x entregue (ciclo atual) ${totalPend ? badge(totalPend + ' item(ns) pendente(s)', 'amarelo') : badge('Em dia', 'verde')}</h2>
+    ${tabela([['Item'], ['Tam.'], ['Direito', 'num'], ['Entregue', 'num'], ['Pendente', 'num'], ['Ciclo'], ['Situacao']],
+      pend.map(p => linha([esc(itemNome(p.item_id)), p.tamanho ? esc(p.tamanho) : badge('sem tamanho', 'vermelho'), p.direito, p.entregue, p.pendente,
+        p.ciclo_fim ? `${fmtData(p.ciclo_inicio)} a ${fmtData(p.ciclo_fim)}` : 'Unico (sem troca)',
+        p.pendente === 0 ? badge('Entregue', 'verde') : (p.atrasada ? badge('Atrasado ' + p.dias_em_aberto + 'd', 'vermelho') : badge('Pendente', 'amarelo'))],
+        p.pendente === 0 ? 'row-ok' : (p.atrasada ? 'row-erro' : 'row-falta'))),
+      'O cargo deste colaborador nao tem kit configurado (Cadastros > Cargos e kits).')}
+    <h2>Historico de entregas</h2>
+    ${tabela([['Data'], ['N.'], ['Itens'], ['Entregue por'], ['']],
+      d.historico.map(e => [fmtData(e.data), esc(e.id) + (e.origem === 'IMPORTACAO' ? ' ' + badge('historico') : ''),
+        itensResumo(e.itens) + (e.itens.some(i => i.motivo === 'SUBSTITUICAO') ? ' ' + badge('substituicao') : ''), esc(e.entregue_por),
+        `<a href="#/termo/${esc(e.id)}">Termo</a>`]), 'Nenhuma entrega registrada.')}`;
+}
+
+async function viewColabForm(id) {
+  let c = { ativo: true, tamanhos: {}, admissao: '' };
+  if (id !== 'novo') c = (await load('colaboradores.ficha', { id })).colaborador;
+  const postos = Array.from(new Set(S.ref.colaboradores.map(x => x.posto).filter(Boolean))).sort();
+  app.innerHTML = `
+    <h1>${id === 'novo' ? 'Novo colaborador' : 'Editar: ' + esc(c.nome)}</h1>
+    <form id="f" class="card">
+      <div class="form">
+        <div><label>Matricula</label><input name="matricula" value="${esc(c.matricula)}"></div>
+        <div class="full"><label>Nome completo *</label><input name="nome" required value="${esc(c.nome)}"></div>
+        <div><label>Cargo *</label><select name="cargo_id" required>${opts(S.ref.cargos.filter(x => x.ativo || x.id === c.cargo_id), c.cargo_id, 'id', x => x.nome, 'Selecione...')}</select></div>
+        <div><label>Posto / contrato</label><input name="posto" list="postos" value="${esc(c.posto)}"><datalist id="postos">${postos.map(p => `<option value="${esc(p)}">`).join('')}</datalist></div>
+        <div><label>Admissao *</label><input type="date" name="admissao" required value="${esc(c.admissao)}"></div>
+        <div><label>Telefone</label><input name="telefone" value="${esc(c.telefone)}"></div>
+      </div>
+      <h2>Tamanhos</h2>
+      <div class="form">
+        ${gradesComTamanho().map(g => `<div><label>${esc(g.nome)}</label><select data-grade="${esc(g.id)}">${opts(tamanhosGrade(g), (c.tamanhos || {})[g.id], x => x, x => x, 'Nao informado')}</select></div>`).join('')}
+      </div>
+      <h2>Situacao</h2>
+      <div class="form">
+        <div><label><input type="checkbox" name="ativo" ${c.ativo ? 'checked' : ''}> Ativo</label></div>
+        <div><label>Desligamento</label><input type="date" name="desligamento" value="${esc(c.desligamento)}"></div>
+        <div class="full"><label>Observacoes</label><textarea name="obs" rows="2">${esc(c.obs)}</textarea></div>
+      </div>
+      <div class="toolbar" style="margin-top:16px"><button class="btn" type="submit">Salvar</button>
+        <a class="btn sec" href="${id === 'novo' ? '#/colaboradores' : '#/colaborador/' + esc(id)}">Cancelar</a></div>
+    </form>
+    ${S.ref.cargos.length ? '' : '<div class="alerta-box">Nenhum cargo cadastrado. Cadastre em Cadastros &gt; Cargos e kits.</div>'}`;
+  $('#f').onsubmit = async e => {
+    e.preventDefault();
+    const dados = lerForm(e.target);
+    dados.tamanhos = {};
+    $$('[data-grade]').forEach(s => { if (s.value) dados.tamanhos[s.dataset.grade] = s.value; });
+    if (id !== 'novo') dados.id = id;
+    const r = await salvar('colaboradores.save', dados, 'Colaborador salvo.');
+    if (r) { await recarregarRef(); ir('#/colaborador/' + r.id); }
+  };
+}
+
+// ------------------------------------------------------------------ entregas
+async function viewEntregas() {
+  const lista = await load('entregas.list', { limite: 500 });
+  app.innerHTML = `
+    <h1>Entregas aos colaboradores</h1>
+    <div class="toolbar"><input id="busca" class="grow" placeholder="Filtrar por colaborador, matricula, item, numero...">
+      ${pode('entregas') ? '<a class="btn" href="#/entrega-nova">+ Nova entrega</a>' : ''}</div>
+    <div id="tab"></div>`;
+  const desenhar = () => {
+    const q = $('#busca').value.trim().toLowerCase();
+    const f = lista.filter(e => !q || [e.id, e.colaborador, e.matricula, e.itens.map(i => itemNome(i.item_id)).join(' ')].join(' ').toLowerCase().includes(q));
+    $('#tab').innerHTML = tabela([['Data'], ['N.'], ['Colaborador'], ['Itens'], ['Entregue por'], ['']],
+      f.map(e => [fmtData(e.data), esc(e.id) + (e.origem === 'IMPORTACAO' ? ' ' + badge('historico') : ''),
+        `<a href="#/colaborador/${esc(e.colaborador_id)}">${esc(e.colaborador)}</a>`, itensResumo(e.itens), esc(e.entregue_por), `<a href="#/termo/${esc(e.id)}">Termo</a>`]),
+      'Nenhuma entrega registrada.');
+  };
+  $('#busca').oninput = desenhar; desenhar();
+}
+
+async function viewEntregaNova(colabId) {
+  const ativos = S.ref.colaboradores.filter(c => c.ativo).sort((a, b) => a.nome.localeCompare(b.nome));
+  app.innerHTML = `
+    <h1>Registrar entrega</h1>
+    <div class="card">
+      <div class="form">
+        <div class="full"><label>Colaborador *</label>
+          <input id="filtroColab" placeholder="Digite para filtrar..." style="margin-bottom:6px">
+          <select id="colab">${opts(ativos, colabId, 'id', c => `${c.nome}${c.matricula ? ' (' + c.matricula + ')' : ''}`, 'Selecione...')}</select></div>
+        <div><label>Data da entrega *</label><input type="date" id="data" value="${esc(S.ref.hoje)}" max="${esc(S.ref.hoje)}"></div>
+        <div class="full"><label>Observacao</label><input id="obs"></div>
+      </div>
+    </div>
+    <div id="area"></div>`;
+  $('#filtroColab').oninput = e => {
+    const q = e.target.value.toLowerCase(); const sel = $('#colab').value;
+    $('#colab').innerHTML = opts(ativos.filter(c => (c.nome + ' ' + c.matricula).toLowerCase().includes(q)), sel, 'id', c => `${c.nome}${c.matricula ? ' (' + c.matricula + ')' : ''}`, 'Selecione...');
+  };
+  const carregar = async () => {
+    const id = $('#colab').value;
+    if (!id) { $('#area').innerHTML = ''; return; }
+    $('#area').innerHTML = '<div class="loading">Carregando pendencias...</div>';
+    const [ficha, est] = await Promise.all([load('colaboradores.ficha', { id }), load('estoque.get')]);
+    const estoque = {}; est.linhas.forEach(l => { estoque[chave(l.item_id, l.tamanho)] = l.estoque; });
+    const pend = ficha.pendencias.filter(p => p.pendente > 0);
+    $('#area').innerHTML = `
+      ${pend.some(p => !p.tamanho) ? `<div class="alerta-box">Este colaborador tem tamanho nao informado para algum item. <a href="#/colaborador-form/${esc(id)}">Completar cadastro</a>.</div>` : ''}
+      <h2>Itens a entregar</h2>
+      <p class="hint">${pend.length ? 'Pre-preenchido com as pendencias do colaborador. Ajuste as quantidades ao que esta sendo entregue de fato.' : 'Nenhuma pendencia: use "Adicionar item" para substituicoes.'}
+        "Kit" abate o direito do ciclo; "Substituicao" (dano/perda) nao abate.</p>
+      <div id="linhas"></div>
+      <div class="toolbar" style="margin-top:16px"><button class="btn" id="btnSalvar">Confirmar entrega</button><a class="btn sec" href="#/colaborador/${esc(id)}">Ver ficha</a></div>`;
+    const ed = editorLinhas($('#linhas'), {
+      linhas: pend.map(p => ({ item_id: p.item_id, tamanho: p.tamanho, quantidade: p.pendente, motivo: 'KIT' })),
+      iniciarVazio: true,
+      novaLinha: () => ({ motivo: 'SUBSTITUICAO' }),
+      colunas: [
+        { titulo: 'Item', render: R.item }, { titulo: 'Tam.', render: R.tam }, { titulo: 'Qtd', render: R.num('quantidade') },
+        { titulo: 'Motivo', render: R.motivo }, { titulo: 'Em estoque', cls: 'num', render: () => '<span data-est></span>' }
+      ],
+      onRow: tr => {
+        if (!tr) return;
+        const it = $('[data-f=item_id]', tr).value, tm = $('[data-f=tamanho]', tr).value, q = Number($('[data-f=quantidade]', tr).value) || 0;
+        const disp = it && tm ? (estoque[chave(it, tm)] || 0) : '';
+        $('[data-est]', tr).innerHTML = disp === '' ? '-' : (q > disp ? badge(disp, 'vermelho') : badge(disp, 'verde'));
+      }
+    });
+    $('#btnSalvar').onclick = async () => {
+      const itens = ed.ler().filter(l => l.item_id && Number(l.quantidade) > 0);
+      const r = await salvar('entregas.criar', { colaborador_id: id, data: $('#data').value, obs: $('#obs').value, itens }, 'Entrega registrada.');
+      if (r) ir('#/termo/' + r.id);
+    };
+  };
+  $('#colab').onchange = () => carregar().catch(e => { if (!(e instanceof Stale)) toast(e.message, true); });
+  if (colabId) await carregar();
+}
+
+async function viewTermo(id) {
+  const d = await load('entregas.termo', { id });
+  const e = d.entrega, c = d.colaborador;
+  app.innerHTML = `
+    <div class="toolbar no-print"><button class="btn" id="btnPrint">Imprimir / Salvar PDF</button>
+      <a class="btn sec" href="#/colaborador/${esc(c.id)}">Ver ficha do colaborador</a><a class="btn sec" href="#/entrega-nova">Nova entrega</a></div>
+    <div class="termo">
+      <h1>TERMO DE RECEBIMENTO DE UNIFORMES</h1>
+      <div class="sub">${esc(d.config.empresa_nome)}</div>
+      <div class="info-grid" style="margin-bottom:16px">
+        <div><span>Entrega n.</span>${esc(e.id)}</div><div><span>Data</span>${fmtData(e.data)}</div>
+        <div><span>Colaborador</span>${esc(c.nome)}</div><div><span>Matricula</span>${esc(c.matricula || '-')}</div>
+        <div><span>Cargo</span>${esc(d.cargo)}</div><div><span>Posto</span>${esc(c.posto || '-')}</div>
+      </div>
+      ${tabela([['Qtd', 'num'], ['Item'], ['Tamanho'], ['Motivo']], d.itens.map(i => [i.quantidade, esc(itemNome(i.item_id)), esc(i.tamanho), esc(MOTIVO_TXT[i.motivo] || i.motivo)]))}
+      ${e.obs ? `<p><b>Obs.:</b> ${esc(e.obs)}</p>` : ''}
+      <p style="margin-top:20px;text-align:justify">${esc(d.config.termo_texto)}</p>
+      <div class="assinaturas">
+        <div>${esc(c.nome)}<br>Colaborador</div>
+        <div>${esc(d.entregue_por_nome)}<br>Responsavel pela entrega</div>
+      </div>
+    </div>`;
+  $('#btnPrint').onclick = () => window.print();
+}
+
+// ------------------------------------------------------------------ compras
+async function viewSugestao() {
+  const d = await load('sugestao.get', { horizonte: S.filtros.horizonte });
+  app.innerHTML = `
+    <h1>Sugestao de compra</h1>
+    <div class="toolbar">
+      <label style="margin:0">Considerar trocas previstas nos proximos</label>
+      <select id="hor" style="width:auto">${opts([0, 30, 60, 90, 180], d.horizonte, x => x, x => x ? x + ' dias' : 'Nao considerar')}</select>
+      <span class="grow"></span>
+      ${pode('pedidos') ? '<button class="btn" id="btnPedido">Criar pedido com selecionados</button>' : ''}
+    </div>
+    <p class="hint">Sugerido = pendente agora + troca prevista - estoque - ja pedido (saldo de pedidos em aberto). Ajuste as quantidades antes de gerar o pedido.</p>
+    ${d.semTamanho.length ? `<div class="alerta-box"><b>${d.semTamanho.length} pendencia(s) sem tamanho cadastrado</b> (nao entram no calculo): ${d.semTamanho.slice(0, 15).map(s => `<a href="#/colaborador-form/${esc(s.colaborador_id)}">${esc(s.colaborador)}</a> (${esc(itemNome(s.item_id))})`).join(', ')}${d.semTamanho.length > 15 ? '...' : ''}</div>` : ''}
+    ${tabela([[''], ['Item'], ['Tam.'], ['Pendente agora', 'num'], ['Troca prevista', 'num'], ['Estoque', 'num'], ['Ja pedido', 'num'], ['Comprar', 'num']],
+      d.linhas.map((l, i) => linha([`<input type="checkbox" data-i="${i}" ${l.sugerido > 0 ? 'checked' : ''}>`, esc(itemNome(l.item_id)), esc(l.tamanho), l.demanda_atual, l.demanda_prevista, l.estoque, l.em_pedido,
+        `<input type="number" min="0" step="1" data-q="${i}" value="${l.sugerido}" style="width:80px">`], l.sugerido > 0 ? 'row-falta' : 'row-ok')),
+      'Nenhuma demanda no momento.')}`;
+  $('#hor').onchange = e => { S.filtros.horizonte = e.target.value; render(); };
+  if ($('#btnPedido')) $('#btnPedido').onclick = () => {
+    const itens = d.linhas.map((l, i) => ({ item_id: l.item_id, tamanho: l.tamanho, quantidade: Number($(`[data-q="${i}"]`).value) || 0, sel: $(`[data-i="${i}"]`).checked }))
+      .filter(l => l.sel && l.quantidade > 0);
+    if (!itens.length) { toast('Selecione ao menos um item com quantidade.', true); return; }
+    S.rascunhoPedido = itens; ir('#/pedido-novo');
+  };
+}
+
+async function viewPedidos() {
+  const lista = await load('pedidos.list');
+  const f = S.filtros.pedidos || 'abertos';
+  app.innerHTML = `
+    <h1>Pedidos ao fornecedor</h1>
+    <div class="toolbar">
+      <select id="filtro" style="width:auto">${opts([['abertos', 'Em aberto'], ['todos', 'Todos']], f, x => x[0], x => x[1])}</select>
+      <span class="grow"></span>
+      <a class="btn sec" href="#/sugestao">Sugestao de compra</a>
+      ${pode('pedidos') ? '<a class="btn" href="#/pedido-novo">+ Novo pedido</a>' : ''}
+    </div><div id="tab"></div>`;
+  const desenhar = () => {
+    S.filtros.pedidos = $('#filtro').value;
+    const fl = lista.filter(p => S.filtros.pedidos === 'todos' || p.status === 'ABERTO' || p.status === 'PARCIAL');
+    $('#tab').innerHTML = tabela([['Pedido'], ['Fornecedor'], ['Data'], ['Previsao'], ['Status'], ['Pedido', 'num'], ['Recebido', 'num'], ['Falta', 'num'], ['Divergencias']],
+      fl.map(p => [`<a href="#/pedido/${esc(p.id)}">${esc(p.id)}</a>`, esc(p.fornecedor), fmtData(p.data), fmtData(p.previsao_entrega), badgeStatus(p.status, p.atrasado),
+        p.total_pedido, p.total_recebido, p.total_saldo ? badge(p.total_saldo, 'amarelo') : '0', p.divergencias ? badge('Sim', 'vermelho') : '']),
+      'Nenhum pedido.');
+  };
+  $('#filtro').onchange = desenhar; desenhar();
+}
+
+async function viewPedidoNovo() {
+  const rascunho = S.rascunhoPedido || [];
+  S.rascunhoPedido = null;
+  const forns = S.ref.fornecedores.filter(f => f.ativo);
+  app.innerHTML = `
+    <h1>Novo pedido</h1>
+    ${forns.length ? '' : '<div class="alerta-box">Nenhum fornecedor cadastrado. <a href="#/cadastros/fornecedores">Cadastrar fornecedor</a>.</div>'}
+    <div class="card"><div class="form">
+      <div><label>Fornecedor *</label><select id="forn">${opts(forns, forns.length === 1 ? forns[0].id : '', 'id', f => f.nome, 'Selecione...')}</select></div>
+      <div><label>Data do pedido *</label><input type="date" id="data" value="${esc(S.ref.hoje)}"></div>
+      <div><label>Previsao de entrega</label><input type="date" id="prev"></div>
+      <div class="full"><label>Observacao</label><input id="obs"></div>
+    </div></div>
+    <h2>Itens</h2><div id="linhas"></div>
+    <div class="toolbar" style="margin-top:16px"><button class="btn" id="btnSalvar">Registrar pedido</button><a class="btn sec" href="#/pedidos">Cancelar</a></div>`;
+  const ed = editorLinhas($('#linhas'), {
+    linhas: rascunho,
+    colunas: [{ titulo: 'Item', render: R.item }, { titulo: 'Tam.', render: R.tam }, { titulo: 'Qtd', render: R.num('quantidade', 1) }]
+  });
+  $('#btnSalvar').onclick = async () => {
+    const itens = ed.ler().filter(l => l.item_id || l.quantidade);
+    const r = await salvar('pedidos.criar', { fornecedor_id: $('#forn').value, data: $('#data').value, previsao_entrega: $('#prev').value, obs: $('#obs').value, itens }, 'Pedido registrado.');
+    if (r) ir('#/pedido/' + r.id);
+  };
+}
+
+async function viewPedido(id) {
+  const d = await load('pedidos.get', { id });
+  const p = d.pedido;
+  const div = d.divergencias;
+  app.innerHTML = `
+    <div class="toolbar"><h1 class="grow" style="margin:0">Pedido ${esc(p.id)} ${badgeStatus(p.status, p.atrasado)}</h1>
+      ${p.aberto && pode('recebimentos') ? `<a class="btn" href="#/recebimento-novo/${esc(p.id)}">Registrar recebimento</a>` : ''}</div>
+    <div class="card"><div class="info-grid">
+      <div><span>Fornecedor</span>${esc(d.fornecedor.nome)}</div><div><span>Data</span>${fmtData(p.data)}</div>
+      <div><span>Previsao</span>${fmtData(p.previsao_entrega) || '-'}</div><div><span>Criado por</span>${esc(p.criado_por)}</div>
+      <div><span>Pedido / recebido / falta</span>${p.total_pedido} / ${p.total_recebido} / ${p.total_saldo}</div>
+    </div>${p.obs ? `<p class="hint">${esc(p.obs)}</p>` : ''}</div>
+    ${div.length ? `<div class="alerta-box"><b>Pendencias e divergencias com o fornecedor:</b><br>${div.map(x => `${esc(DIVERG_TXT[x.tipo])}: ${x.quantidade}x ${esc(itemNome(x.item_id))} (${esc(x.tamanho)})`).join('<br>')}</div>` : ''}
+    <h2>Itens do pedido</h2>
+    ${tabela([['Item'], ['Tam.'], ['Pedido', 'num'], ['Recebido', 'num'], ['Rejeitado', 'num'], ['Falta', 'num'], ['Situacao']],
+      p.itens.map(l => linha([esc(itemNome(l.item_id)), esc(l.tamanho), l.quantidade, l.recebido, l.rejeitado, l.saldo,
+        l.saldo === 0 ? badge('Completo', 'verde') + (l.excedente ? ' ' + badge('+' + l.excedente, 'amarelo') : '') : (l.recebido ? badge('Parcial', 'amarelo') : badge('Aguardando', 'azul'))],
+        l.saldo === 0 ? 'row-ok' : 'row-falta')))}
+    ${p.nao_pedidos.length ? '<h2>Recebido fora do pedido (tamanho ou item errado)</h2>' + tabela([['Item'], ['Tam.'], ['Recebido', 'num'], ['Rejeitado', 'num']],
+      p.nao_pedidos.map(l => linha([esc(itemNome(l.item_id)), esc(l.tamanho), l.recebido, l.rejeitado], 'row-erro'))) : ''}
+    <h2>Recebimentos</h2>
+    ${tabela([['N.'], ['Data'], ['NF'], ['Itens'], ['Recebido por']],
+      d.recebimentos.map(r => [esc(r.id), fmtData(r.data), esc(r.nota_fiscal), r.itens.map(i => `${i.qtd_recebida}x ${esc(itemNome(i.item_id))} (${esc(i.tamanho)})${i.qtd_rejeitada ? ' ' + badge(i.qtd_rejeitada + ' rejeitado(s): ' + i.motivo_rejeicao, 'vermelho') : ''}`).join('<br>'), esc(r.recebido_por)]),
+      'Nenhum recebimento ainda.')}
+    ${pode('pedidos') ? `
+      <h2>Acoes</h2>
+      <div class="card"><div class="form">
+        <div class="full"><label>Observacao / motivo</label><input id="obsStatus" placeholder="Ex.: fornecedor nao vai entregar o restante"></div></div>
+        <div class="toolbar" style="margin-top:12px">
+          ${p.aberto ? '<button class="btn sec" data-st="ENCERRADO">Encerrar com pendencia</button>' : ''}
+          ${p.aberto && p.total_recebido === 0 ? '<button class="btn perigo" data-st="CANCELADO">Cancelar pedido</button>' : ''}
+          ${!p.aberto && p.status !== 'CONCLUIDO' ? '<button class="btn sec" data-st="ABERTO">Reabrir pedido</button>' : ''}
+        </div>
+        <p class="hint">Encerrar retira o saldo de "ja pedido" e ele volta para a sugestao de compra.</p>
+      </div>` : ''}`;
+  $$('[data-st]').forEach(b => b.onclick = async () => {
+    const r = await salvar('pedidos.status', { id: p.id, status: b.dataset.st, obs: $('#obsStatus').value }, 'Pedido atualizado.');
+    if (r) render();
+  });
+}
+
+async function viewRecebimentos() {
+  const lista = await load('recebimentos.list');
+  app.innerHTML = `<h1>Recebimentos do fornecedor</h1>
+    <div class="toolbar"><span class="grow"></span>${pode('recebimentos') ? '<a class="btn" href="#/recebimento-novo">+ Registrar recebimento</a>' : ''}</div>
+    ${tabela([['N.'], ['Data'], ['Pedido'], ['Fornecedor'], ['NF'], ['Recebido', 'num'], ['Rejeitado', 'num'], ['Recebido por']],
+      lista.map(r => [esc(r.id), fmtData(r.data), r.pedido_id ? `<a href="#/pedido/${esc(r.pedido_id)}">${esc(r.pedido_id)}</a>` : badge('avulso'), esc(r.fornecedor), esc(r.nota_fiscal),
+        r.total_recebido, r.total_rejeitado ? badge(r.total_rejeitado, 'vermelho') : '0', esc(r.recebido_por)]), 'Nenhum recebimento.')}`;
+}
+
+async function viewRecebimentoNovo(pedidoId) {
+  const pedidos = (await load('pedidos.list')).filter(p => p.status === 'ABERTO' || p.status === 'PARCIAL');
+  app.innerHTML = `
+    <h1>Registrar recebimento (conferencia)</h1>
+    <div class="card"><div class="form">
+      <div class="full"><label>Pedido</label><select id="ped">${opts(pedidos, pedidoId, 'id', p => `${p.id} - ${p.fornecedor} (${fmtData(p.data)}) - falta ${p.total_saldo}`, 'Sem pedido (recebimento avulso)')}</select></div>
+      <div><label>Data do recebimento *</label><input type="date" id="data" value="${esc(S.ref.hoje)}" max="${esc(S.ref.hoje)}"></div>
+      <div><label>Nota fiscal</label><input id="nf"></div>
+      <div class="full"><label>Observacao</label><input id="obs"></div>
+    </div></div><div id="area"></div>`;
+  const montar = async () => {
+    const id = $('#ped').value;
+    let linhas = [];
+    if (id) {
+      const d = await load('pedidos.get', { id });
+      linhas = d.pedido.itens.filter(l => l.saldo > 0).map(l => ({ item_id: l.item_id, tamanho: l.tamanho, esperado: l.saldo, qtd_rejeitada: 0, _fixo: true }));
+    }
+    $('#area').innerHTML = `
+      <h2>Conferencia dos itens</h2>
+      <p class="hint">Conte o que chegou e digite em "Recebido". Itens com defeito: informe em "Rejeitado" e o motivo (nao entram no estoque).
+        Tamanho ou item errado: use "Adicionar item nao previsto".</p>
+      ${id ? '<button class="btn sec peq" id="btnSaldo" style="margin-bottom:8px">Preencher "Recebido" com o esperado</button>' : ''}
+      <div id="linhas"></div>
+      <div class="toolbar" style="margin-top:16px"><button class="btn" id="btnSalvar">Confirmar recebimento</button></div>
+      <div id="resultado"></div>`;
+    const fixo = (renderFixo, renderLivre) => l => l._fixo ? renderFixo(l) : renderLivre(l);
+    const ed = editorLinhas($('#linhas'), {
+      linhas, iniciarVazio: !!id, rotuloAdicionar: 'Adicionar item nao previsto',
+      colunas: [
+        { titulo: 'Item', render: fixo(R.itemFixo, R.item) }, { titulo: 'Tam.', render: fixo(R.tamFixo, R.tam) },
+        { titulo: 'Esperado', cls: 'num', render: l => `<span data-esp>${l.esperado || 0}</span>` },
+        { titulo: 'Recebido', render: R.num('qtd_recebida') }, { titulo: 'Rejeitado', render: R.num('qtd_rejeitada') },
+        { titulo: 'Motivo rejeicao', render: R.texto('motivo_rejeicao', 'defeito, avaria...') }
+      ],
+      onRow: tr => {
+        if (!tr) return;
+        const esp = Number($('[data-esp]', tr).textContent) || 0;
+        const rec = $('[data-f=qtd_recebida]', tr).value;
+        const ok = (Number(rec) || 0) - (Number($('[data-f=qtd_rejeitada]', tr).value) || 0);
+        tr.className = rec === '' ? '' : (esp === 0 || ok > esp ? 'row-erro' : (ok < esp ? 'row-falta' : 'row-ok'));
+      }
+    });
+    if ($('#btnSaldo')) $('#btnSaldo').onclick = () => $$('tr', ed.tbody).forEach(tr => {
+      const inp = $('[data-f=qtd_recebida]', tr); inp.value = $('[data-esp]', tr).textContent; inp.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    $('#btnSalvar').onclick = async () => {
+      const itens = ed.ler().filter(l => Number(l.qtd_recebida) > 0 || Number(l.qtd_rejeitada) > 0);
+      const r = await salvar('recebimentos.criar', { pedido_id: id, data: $('#data').value, nota_fiscal: $('#nf').value, obs: $('#obs').value, itens }, 'Recebimento registrado.');
+      if (!r) return;
+      const div = r.divergencias || [];
+      app.innerHTML = `<h1>Recebimento ${esc(r.id)} registrado</h1>
+        ${r.pedido_id ? `<p>Situacao do pedido ${esc(r.pedido_id)}: ${badgeStatus(r.status)}</p>` : ''}
+        ${div.length ? `<div class="alerta-box"><b>Divergencias registradas (cobrar do fornecedor):</b><br>${div.map(x => `${esc(DIVERG_TXT[x.tipo])}: ${x.quantidade}x ${esc(itemNome(x.item_id))} (${esc(x.tamanho)})`).join('<br>')}</div>`
+          : (r.pedido_id ? '<div class="alerta-box ok">Pedido conferido sem divergencias.</div>' : '')}
+        <div class="toolbar">${r.pedido_id ? `<a class="btn" href="#/pedido/${esc(r.pedido_id)}">Ver pedido</a>` : ''}<a class="btn sec" href="#/estoque">Ver estoque</a>
+          <a class="btn sec" href="#/painel">Painel</a></div>`;
+    };
+  };
+  $('#ped').onchange = () => montar().catch(e => { if (!(e instanceof Stale)) toast(e.message, true); });
+  await montar();
+}
+
+// ------------------------------------------------------------------ estoque
+async function viewEstoque() {
+  const d = await load('estoque.get');
+  app.innerHTML = `
+    <h1>Estoque</h1>
+    <div class="toolbar"><input id="busca" class="grow" placeholder="Filtrar por item...">
+      <label style="margin:0"><input type="checkbox" id="soFalta"> Somente onde falta</label></div>
+    <div id="tab"></div>
+    ${pode('estoque') ? `
+      <h2>Ajuste de estoque (inventario, perda, devolucao)</h2>
+      <form id="fAj" class="card"><div class="form">
+        <div><label>Item *</label><select name="item_id" id="ajItem">${opts(S.ref.itens.filter(i => i.ativo), '', 'id', i => i.nome, 'Selecione...')}</select></div>
+        <div><label>Tamanho *</label><select name="tamanho" id="ajTam"><option value="">-</option></select></div>
+        <div><label>Quantidade * (negativo para saida)</label><input type="number" step="1" name="quantidade"></div>
+        <div class="full"><label>Motivo *</label><input name="motivo" placeholder="Ex.: inventario inicial, devolucao de colaborador desligado, extravio"></div>
+      </div><div class="toolbar" style="margin-top:12px"><button class="btn" type="submit">Registrar ajuste</button></div></form>` : ''}
+    <h2>Ultimos ajustes</h2>
+    ${tabela([['Data'], ['Item'], ['Tam.'], ['Qtd', 'num'], ['Motivo'], ['Usuario']],
+      d.ajustes.map(a => [fmtData(a.data), esc(itemNome(a.item_id)), esc(a.tamanho), a.quantidade > 0 ? '+' + a.quantidade : a.quantidade, esc(a.motivo), esc(a.usuario)]), 'Nenhum ajuste.')}`;
+  const desenhar = () => {
+    const q = $('#busca').value.trim().toLowerCase(), so = $('#soFalta').checked;
+    const f = d.linhas.filter(l => (!q || itemNome(l.item_id).toLowerCase().includes(q)) && (!so || l.saldo_apos < 0));
+    $('#tab').innerHTML = tabela([['Item'], ['Tam.'], ['Em estoque', 'num'], ['Pendente p/ colaboradores', 'num'], ['Ja pedido', 'num'], ['Saldo apos entregar', 'num']],
+      f.map(l => linha([esc(itemNome(l.item_id)), esc(l.tamanho), l.estoque, l.pendente, l.em_pedido, l.saldo_apos < 0 ? badge(l.saldo_apos, 'vermelho') : l.saldo_apos],
+        l.saldo_apos < 0 ? 'row-falta' : '')), 'Sem movimentacao de estoque.');
+  };
+  $('#busca').oninput = desenhar; $('#soFalta').onchange = desenhar; desenhar();
+  if ($('#fAj')) {
+    $('#ajItem').onchange = e => { $('#ajTam').innerHTML = opcoesTam(e.target.value, ''); };
+    $('#fAj').onsubmit = async e => {
+      e.preventDefault();
+      const r = await salvar('estoque.ajustar', lerForm(e.target), 'Ajuste registrado.');
+      if (r) render();
+    };
+  }
+}
+
+// ------------------------------------------------------------------ cadastros
+const ABAS_CAD = [
+  ['itens', 'Itens', 'admin'], ['grades', 'Grades de tamanho', 'admin'], ['cargos', 'Cargos e kits', 'admin'],
+  ['fornecedores', 'Fornecedores', 'fornecedores'], ['usuarios', 'Usuarios', 'admin'], ['config', 'Configuracoes', 'admin'], ['importacao', 'Importacao', 'admin']
+];
+
+async function viewCadastros(aba) {
+  const abas = ABAS_CAD.filter(a => pode(a[2]));
+  if (!abas.length) throw new Error('Sem permissao.');
+  if (!aba || !abas.some(a => a[0] === aba)) aba = abas[0][0];
+  app.innerHTML = `<h1>Cadastros</h1>
+    <div class="tabs">${abas.map(a => `<a href="#/cadastros/${a[0]}" class="${a[0] === aba ? 'ativo' : ''}">${esc(a[1])}</a>`).join('')}</div>
+    <div id="cad"></div>`;
+  await ({ itens: cadItens, grades: cadGrades, cargos: cadCargos, fornecedores: cadFornecedores, usuarios: cadUsuarios, config: cadConfig, importacao: cadImportacao })[aba]($('#cad'));
+}
+
+/** Monta formulario + tabela com botao "editar" que preenche o formulario. */
+function cadSimples(el, cfg) {
+  el.innerHTML = `<form id="fCad" class="card"><div class="form">${cfg.campos}</div>
+      <div class="toolbar" style="margin-top:12px"><button class="btn" type="submit">Salvar</button><button class="btn sec" type="reset">Limpar / novo</button></div>
+      ${cfg.dica ? `<p class="hint">${cfg.dica}</p>` : ''}</form>
+    ${tabela(cfg.colunas, cfg.lista.map((x, i) => cfg.linha(x).concat([`<button class="btn sec peq" data-ed="${i}">Editar</button>`])), 'Nenhum registro.')}`;
+  const form = $('#fCad', el);
+  $$('[data-ed]', el).forEach(b => b.onclick = () => {
+    const x = cfg.lista[Number(b.dataset.ed)];
+    $$('[name]', form).forEach(inp => {
+      const v = x[inp.name];
+      if (inp.type === 'checkbox') inp.checked = !!v; else inp.value = v === undefined || v === null ? '' : v;
+    });
+    if (cfg.aoEditar) cfg.aoEditar(form, x);
+    form.scrollIntoView({ behavior: 'smooth' });
+  });
+  form.onreset = () => setTimeout(() => { if (cfg.aoLimpar) cfg.aoLimpar(form); });
+  form.onsubmit = async e => {
+    e.preventDefault();
+    const r = await salvar(cfg.acao, lerForm(form), 'Salvo.');
+    if (r) { if (cfg.aposSalvar) cfg.aposSalvar(r); await recarregarRef(); render(); }
+  };
+}
+
+function cadItens(el) {
+  cadSimples(el, {
+    acao: 'itens.save', lista: S.ref.itens.slice().sort((a, b) => a.nome.localeCompare(b.nome)),
+    campos: `<input type="hidden" name="id">
+      <div><label>Nome do item *</label><input name="nome" required placeholder="Ex.: Camisa polo"></div>
+      <div><label>Grade de tamanhos *</label><select name="grade_id" required>${opts(S.ref.grades.filter(g => g.ativo), '', 'id', g => g.nome + ' (' + g.tamanhos + ')', 'Selecione...')}</select></div>
+      <div><label>Unidade</label><input name="unidade" placeholder="un, par..."></div>
+      <div><label><input type="checkbox" name="ativo" checked> Ativo</label></div>`,
+    dica: 'A grade define os tamanhos possiveis do item. Para criar uma grade nova (ex.: luvas P/M/G), use a aba "Grades de tamanho".',
+    colunas: [['Codigo'], ['Item'], ['Grade'], ['Unid.'], ['Situacao'], ['']],
+    linha: i => [esc(i.id), esc(i.nome), esc((porId(S.ref.grades, i.grade_id) || {}).nome || i.grade_id), esc(i.unidade), i.ativo ? badge('Ativo', 'verde') : badge('Inativo')]
+  });
+}
+
+function cadGrades(el) {
+  cadSimples(el, {
+    acao: 'grades.save', lista: S.ref.grades.slice().sort((a, b) => a.ordem - b.ordem),
+    campos: `<div><label>Codigo * (sem espacos)</label><input name="id" required placeholder="Ex.: LUVA"></div>
+      <div><label>Nome *</label><input name="nome" required placeholder="Ex.: Luvas"></div>
+      <div class="full"><label>Tamanhos * (separados por virgula, na ordem)</label><input name="tamanhos" required placeholder="Ex.: P,M,G"></div>
+      <div><label>Ordem de exibicao</label><input type="number" name="ordem" value="10"></div>
+      <div><label><input type="checkbox" name="ativo" checked> Ativa</label></div>`,
+    dica: 'Cada grade vira um campo de tamanho no cadastro do colaborador. Nao renomeie tamanhos ja usados em pedidos/entregas; acrescente novos ao final.',
+    colunas: [['Codigo'], ['Nome'], ['Tamanhos'], ['Situacao'], ['']],
+    linha: g => [esc(g.id), esc(g.nome), esc(g.tamanhos), g.ativo ? badge('Ativa', 'verde') : badge('Inativa')],
+    aoEditar: f => { f.id.readOnly = true; }, aoLimpar: f => { f.id.readOnly = false; }
+  });
+}
+
+function cadCargos(el) {
+  const cargos = S.ref.cargos.slice().sort((a, b) => a.nome.localeCompare(b.nome));
+  const sel = S.filtros.cargoSel && porId(cargos, S.filtros.cargoSel) ? S.filtros.cargoSel : (cargos[0] || {}).id;
+  el.innerHTML = `<div id="cadCargo"></div>
+    <h2>Kit do cargo</h2>
+    ${cargos.length ? `<div class="toolbar"><select id="cargoSel" style="width:auto">${opts(cargos, sel, 'id', c => c.nome)}</select></div>
+      <p class="hint">Informe o que o colaborador deste cargo tem direito. Periodicidade em meses (0 = entrega unica, sem troca). Os ciclos contam a partir da admissao.</p>
+      <div id="kit"></div><div class="toolbar" style="margin-top:12px"><button class="btn" id="btnKit">Salvar kit</button></div>` : '<p class="hint">Cadastre um cargo acima.</p>'}`;
+  cadSimples($('#cadCargo', el), {
+    acao: 'cargos.save', lista: cargos, aposSalvar: r => { S.filtros.cargoSel = r.id; },
+    campos: `<input type="hidden" name="id"><div><label>Cargo *</label><input name="nome" required placeholder="Ex.: Vigilante"></div>
+      <div><label><input type="checkbox" name="ativo" checked> Ativo</label></div>`,
+    colunas: [['Codigo'], ['Cargo'], ['Itens no kit', 'num'], ['Situacao'], ['']],
+    linha: c => [esc(c.id), esc(c.nome), S.ref.kits.filter(k => k.cargo_id === c.id).length, c.ativo ? badge('Ativo', 'verde') : badge('Inativo')]
+  });
+  if (!cargos.length) return;
+  const montarKit = () => {
+    const cargoId = $('#cargoSel').value; S.filtros.cargoSel = cargoId;
+    const ed = editorLinhas($('#kit'), {
+      linhas: S.ref.kits.filter(k => k.cargo_id === cargoId),
+      colunas: [{ titulo: 'Item', render: R.item }, { titulo: 'Quantidade', render: R.num('quantidade', 1) }, { titulo: 'Troca a cada (meses)', render: R.num('periodicidade_meses', 0) }]
+    });
+    $('#btnKit').onclick = async () => {
+      const itens = ed.ler().filter(l => l.item_id);
+      const r = await salvar('kit.save', { cargo_id: cargoId, itens }, 'Kit salvo.');
+      if (r) { await recarregarRef(); render(); }
+    };
+  };
+  $('#cargoSel').onchange = montarKit; montarKit();
+}
+
+function cadFornecedores(el) {
+  cadSimples(el, {
+    acao: 'fornecedores.save', lista: S.ref.fornecedores,
+    campos: `<input type="hidden" name="id"><div><label>Nome *</label><input name="nome" required></div><div><label>CNPJ</label><input name="cnpj"></div>
+      <div><label>Contato</label><input name="contato"></div><div><label>Telefone</label><input name="telefone"></div><div><label>E-mail</label><input name="email"></div>
+      <div><label><input type="checkbox" name="ativo" checked> Ativo</label></div>`,
+    colunas: [['Codigo'], ['Nome'], ['Contato'], ['Telefone'], ['Situacao'], ['']],
+    linha: f => [esc(f.id), esc(f.nome), esc(f.contato), esc(f.telefone), f.ativo ? badge('Ativo', 'verde') : badge('Inativo')]
+  });
+}
+
+async function cadUsuarios(el) {
+  const lista = await load('usuarios.list');
+  cadSimples(el, {
+    acao: 'usuarios.save', lista,
+    campos: `<div><label>E-mail Google *</label><input name="email" type="email" required placeholder="pessoa@gmail.com"></div>
+      <div><label>Nome</label><input name="nome"></div>
+      <div><label>Perfil *</label><select name="perfil">${opts(S.ref.perfis, 'ALMOXARIFE', x => x, x => x)}</select></div>
+      <div><label><input type="checkbox" name="ativo" checked> Ativo</label></div>`,
+    dica: 'GESTOR: acesso total. COMPRADOR: pedidos e fornecedores. ALMOXARIFE: recebimentos, estoque, entregas e colaboradores. Todos podem consultar tudo. ' +
+      'Ao cadastrar, a planilha e compartilhada automaticamente com o e-mail (necessario para o sistema funcionar para a pessoa).',
+    colunas: [['E-mail'], ['Nome'], ['Perfil'], ['Situacao'], ['']],
+    linha: u => [esc(u.email), esc(u.nome), esc(u.perfil), u.ativo ? badge('Ativo', 'verde') : badge('Inativo')],
+    aposSalvar: r => { if (r.aviso) toast(r.aviso, true); else if (r.compartilhado) toast('Planilha compartilhada com ' + r.email + '.'); },
+    aoEditar: f => { f.email.readOnly = true; }, aoLimpar: f => { f.email.readOnly = false; }
+  });
+}
+
+function cadConfig(el) {
+  const c = S.ref.config;
+  el.innerHTML = `<form id="fCfg" class="card"><div class="form">
+      <div class="full"><label>Nome da empresa (aparece no termo)</label><input name="empresa_nome" value="${esc(c.empresa_nome)}"></div>
+      <div><label>Tolerancia para atraso (dias)</label><input type="number" min="0" name="tolerancia_dias" value="${esc(c.tolerancia_dias)}"></div>
+      <div><label>Horizonte padrao da previsao (dias)</label><input type="number" min="0" name="horizonte_previsao_dias" value="${esc(c.horizonte_previsao_dias)}"></div>
+      <div class="full"><label>Texto do termo de recebimento</label><textarea name="termo_texto" rows="4">${esc(c.termo_texto)}</textarea></div>
+    </div><div class="toolbar" style="margin-top:12px"><button class="btn" type="submit">Salvar</button></div></form>
+    ${S.ref.planilhaUrl ? `<p class="hint">Planilha de dados: <a href="${esc(S.ref.planilhaUrl)}" target="_blank">abrir</a> (consulta; evite editar diretamente).</p>` : ''}`;
+  $('#fCfg').onsubmit = async e => {
+    e.preventDefault();
+    const r = await salvar('config.save', lerForm(e.target), 'Configuracoes salvas.');
+    if (r) { await recarregarRef(); render(); }
+  };
+}
+
+function cadImportacao(el) {
+  el.innerHTML = `<div class="card">
+      <p>Para trazer os dados das planilhas atuais:</p>
+      <ol>
+        <li>Cadastre antes os <b>itens</b> (e grades, se precisar) e os <b>cargos com seus kits</b>.</li>
+        <li>Abra a planilha de dados ${S.ref.planilhaUrl ? `(<a href="${esc(S.ref.planilhaUrl)}" target="_blank">abrir</a>)` : ''} e cole os dados nas abas <b>Importar_Colaboradores</b>, <b>Importar_Estoque</b> e <b>Importar_Entregas</b>, respeitando os cabecalhos.</li>
+        <li>Clique no botao correspondente abaixo, nesta ordem. Se houver erro, nada e gravado: a coluna <b>status</b> de cada linha mostra o problema.</li>
+      </ol>
+      <div class="toolbar">
+        <button class="btn" data-imp="colaboradores">1. Importar colaboradores</button>
+        <button class="btn" data-imp="estoque">2. Importar estoque inicial</button>
+        <button class="btn" data-imp="entregas">3. Importar entregas historicas</button>
+      </div>
+      <p class="hint">Entregas historicas contam para o direito do colaborador, mas nao baixam o estoque (o estoque inicial deve ser o saldo fisico contado hoje).</p>
+      <div id="impRes"></div></div>`;
+  $$('[data-imp]', el).forEach(b => b.onclick = async () => {
+    const r = await salvar('importar', { tipo: b.dataset.imp });
+    if (r) { $('#impRes').innerHTML = `<div class="alerta-box ${r.erros ? 'erro' : 'ok'}">${esc(r.mensagem)}</div>`; await recarregarRef(); }
+  });
+}
+
+// ------------------------------------------------------------------ inicializacao
+(async function init() {
+  $('#btnMenu').onclick = () => $('#nav').classList.toggle('aberto');
+  try {
+    S.ref = await call('bootstrap');
+  } catch (e) {
+    app.innerHTML = `<div class="card"><h1>Acesso ao sistema</h1><div class="alerta-box erro">${esc(e.message)}</div></div>`;
+    $('#nav').style.display = 'none';
+    return;
+  }
+  $('#userInfo').innerHTML = `${esc(S.ref.user.nome)}<br>${esc(S.ref.user.perfil)}`;
+  $$('#nav a[data-perm]').forEach(a => { if (!pode(a.dataset.perm) && !(a.dataset.route === 'cadastros' && pode('fornecedores'))) a.style.display = 'none'; });
+  window.addEventListener('hashchange', render);
+  render();
+})();
+</script>
+

@@ -1,0 +1,16 @@
+{
+  "name": "controle-uniformes",
+  "version": "1.0.0",
+  "description": "Sistema de Gestao e Controle de Uniformes via Google Sheets e Apps Script",
+  "main": "src/Logic.js",
+  "scripts": {
+    "test": "node --test tests/**/*.test.js"
+  },
+  "keywords": [
+    "apps-script",
+    "uniformes",
+    "google-sheets"
+  ],
+  "author": "",
+  "license": "MIT"
+}
